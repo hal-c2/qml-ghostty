@@ -32,7 +32,12 @@ endif()
 
 add_subdirectory(src)
 
+option(QML_GHOSTTY_BUILD_EXAMPLES "Build the example shell" ${PROJECT_IS_TOP_LEVEL})
 option(QML_GHOSTTY_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
+
+if(QML_GHOSTTY_BUILD_EXAMPLES)
+  add_subdirectory(examples/shell)
+endif()
 
 if(QML_GHOSTTY_BUILD_TESTS)
   enable_testing()
