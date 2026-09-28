@@ -31,3 +31,10 @@ if(NOT TARGET ghostty::vt)
 endif()
 
 add_subdirectory(src)
+
+option(QML_GHOSTTY_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
+
+if(QML_GHOSTTY_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
