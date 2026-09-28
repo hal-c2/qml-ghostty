@@ -44,7 +44,10 @@ fi
 
 log "building into ${PREFIX}"
 rm -rf "${PREFIX}"
-(cd "${SOURCE}" && "${ZIG}" build -Demit-lib-vt -Doptimize=ReleaseFast -p "${PREFIX}")
+# Only the static library is used. On macOS Ghostty also packages an
+# xcframework whenever xcodebuild is on PATH, which fails with the Command
+# Line Tools' xcodebuild (it needs full Xcode).
+(cd "${SOURCE}" && "${ZIG}" build -Demit-lib-vt -Demit-xcframework=false -Doptimize=ReleaseFast -p "${PREFIX}")
 cp "${SOURCE}/LICENSE" "${PREFIX}/LICENSE"
 printf '%s\n' "${REVISION}" > "${PREFIX}/VERSION"
 log "done"
