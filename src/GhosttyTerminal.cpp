@@ -40,6 +40,9 @@ QByteArray toBytes(const QVariant& data) {
     return data.metaType().id() == QMetaType::QByteArray ? data.toByteArray() : data.toString().toUtf8();
 }
 
+// How often held past the edge scrolls one row. Ghostty's own 15 ms outruns the eye.
+constexpr int kAutoscrollMs = 40;
+
 QString fromGhostty(uint8_t* bytes, size_t length) {
     QString text = QString::fromUtf8(reinterpret_cast<const char*>(bytes), static_cast<qsizetype>(length));
     ghostty_free(nullptr, bytes, length);
@@ -87,16 +90,32 @@ GhosttyTerminalItem::GhosttyTerminalItem(QQuickItem* parent) : QQuickItem(parent
     m_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     m_font.setStyleHint(QFont::Monospace);
 
-    m_blinkTimer.setInterval(QGuiApplication::styleHints()->cursorFlashTime() / 2);
+#ifdef Q_OS_MACOS
+    m_macModifiers = !QCoreApplication::testAttribute(Qt::AA_MacDontSwapCtrlAndMeta);
+#endif
+
     connect(&m_blinkTimer, &QTimer::timeout, this, [this] {
         m_blinkOn = !m_blinkOn;
         requestFrame();
     });
+    connect(QGuiApplication::styleHints(), &QStyleHints::cursorFlashTimeChanged, this, [this] {
+        m_blinkTimer.stop();
+        restartBlink();
+    });
+
+    m_clock.start();
+    m_autoscrollTimer.setInterval(kAutoscrollMs);
+    connect(&m_autoscrollTimer, &QTimer::timeout, this, &GhosttyTerminalItem::autoscrollSelection);
 
     ghostty_key_encoder_new(nullptr, &m_keyEncoder);
     ghostty_key_event_new(nullptr, &m_keyEvent);
     ghostty_mouse_encoder_new(nullptr, &m_mouseEncoder);
     ghostty_mouse_event_new(nullptr, &m_mouseEvent);
+    ghostty_selection_gesture_new(nullptr, &m_gesture);
+    ghostty_selection_gesture_event_new(nullptr, &m_gesturePress, GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS);
+    ghostty_selection_gesture_event_new(nullptr, &m_gestureRelease, GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE);
+    ghostty_selection_gesture_event_new(nullptr, &m_gestureDrag, GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG);
+    ghostty_selection_gesture_event_new(nullptr, &m_gestureTick, GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_AUTOSCROLL_TICK);
     ghostty_render_state_new(nullptr, &m_renderState);
     ghostty_render_state_row_iterator_new(nullptr, &m_rowIterator);
     ghostty_render_state_row_cells_new(nullptr, &m_rowCells);
@@ -107,6 +126,11 @@ GhosttyTerminalItem::GhosttyTerminalItem(QQuickItem* parent) : QQuickItem(parent
 
 GhosttyTerminalItem::~GhosttyTerminalItem() {
     destroyTerminal();
+    ghostty_selection_gesture_free(m_gesture, nullptr);
+    ghostty_selection_gesture_event_free(m_gestureTick);
+    ghostty_selection_gesture_event_free(m_gestureDrag);
+    ghostty_selection_gesture_event_free(m_gestureRelease);
+    ghostty_selection_gesture_event_free(m_gesturePress);
     ghostty_render_state_row_cells_free(m_rowCells);
     ghostty_render_state_row_iterator_free(m_rowIterator);
     ghostty_render_state_free(m_renderState);
@@ -124,8 +148,10 @@ void GhosttyTerminalItem::createTerminal() {
     if (ghostty_terminal_new(nullptr, &m_terminal, options) != GHOSTTY_SUCCESS) {
         qWarning("Ghostty: could not create a terminal");
         m_terminal = nullptr;
+        setError(QStringLiteral("Could not create a terminal"));
         return;
     }
+    setError({});
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_USERDATA, this);
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
                          reinterpret_cast<const void*>(&GhosttyCallbacks::writePty));
@@ -148,8 +174,19 @@ void GhosttyTerminalItem::createTerminal() {
 }
 
 void GhosttyTerminalItem::destroyTerminal() {
-    if (m_terminal != nullptr) ghostty_terminal_free(m_terminal);
+    if (m_terminal != nullptr) {
+        cancelSelecting();
+        ghostty_selection_gesture_reset(m_gesture, m_terminal);
+        ghostty_terminal_free(m_terminal);
+    }
     m_terminal = nullptr;
+    syncMouseTracking();
+}
+
+void GhosttyTerminalItem::setError(const QString& error) {
+    if (m_error == error) return;
+    m_error = error;
+    Q_EMIT errorChanged();
 }
 
 // --- Properties -------------------------------------------------------------
@@ -238,6 +275,20 @@ void GhosttyTerminalItem::setScrollbackLimit(int rows) {
         qWarning("Ghostty: scrollbackLimit only applies before the terminal is complete");
     }
     Q_EMIT scrollbackLimitChanged();
+}
+
+void GhosttyTerminalItem::setCursorBlink(bool blink) {
+    if (m_cursorBlink == blink) return;
+    m_cursorBlink = blink;
+    m_blinkTimer.stop();
+    restartBlink();
+    Q_EMIT cursorBlinkChanged();
+}
+
+void GhosttyTerminalItem::setMacModifiers(bool swapped) {
+    if (m_macModifiers == swapped) return;
+    m_macModifiers = swapped;
+    Q_EMIT macModifiersChanged();
 }
 
 // --- Geometry ---------------------------------------------------------------
@@ -346,8 +397,17 @@ void GhosttyTerminalItem::feed(const QByteArray& bytes, bool answerQueries) {
         m_bellPending = false;
         if (answerQueries) Q_EMIT bell();
     }
+    syncMouseTracking();
     syncScroll();
     requestFrame();
+}
+
+void GhosttyTerminalItem::syncMouseTracking() {
+    bool tracking = false;
+    if (m_terminal != nullptr) ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking);
+    if (tracking == m_mouseTracking) return;
+    m_mouseTracking = tracking;
+    Q_EMIT mouseTrackingChanged();
 }
 
 void GhosttyTerminalItem::flushReplies() {
@@ -370,8 +430,12 @@ void GhosttyTerminalItem::sendUserInput(const QByteArray& bytes) {
 
 void GhosttyTerminalItem::reset() {
     if (m_terminal == nullptr) return;
+    cancelSelecting();
+    ghostty_selection_gesture_reset(m_gesture, m_terminal);
     ghostty_terminal_reset(m_terminal);
     m_replies.clear();
+    m_preedit.clear();
+    syncMouseTracking();
     if (!m_title.isEmpty()) {
         m_title.clear();
         Q_EMIT titleChanged();
@@ -472,9 +536,12 @@ QString GhosttyTerminalItem::text() const {
     return result;
 }
 
-void GhosttyTerminalItem::copy() {
+bool GhosttyTerminalItem::copy() {
     const QString selection = selectedText();
-    if (!selection.isEmpty()) QGuiApplication::clipboard()->setText(selection);
+    if (selection.isEmpty()) return false;
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    clipboard->setText(selection);
+    return clipboard->text() == selection;
 }
 
 void GhosttyTerminalItem::selectAll() {
@@ -482,18 +549,20 @@ void GhosttyTerminalItem::selectAll() {
     GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
     if (ghostty_terminal_select_all(m_terminal, &selection) != GHOSTTY_SUCCESS) return;
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
-    if (!m_hasSelection) {
-        m_hasSelection = true;
-        Q_EMIT selectionChanged();
-    }
-    requestFrame(true);
+    setHasSelection(true);
 }
 
 void GhosttyTerminalItem::clearSelection() {
     if (m_terminal == nullptr || !m_hasSelection) return;
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SELECTION, nullptr);
-    m_hasSelection = false;
-    Q_EMIT selectionChanged();
+    setHasSelection(false);
+}
+
+void GhosttyTerminalItem::setHasSelection(bool hasSelection) {
+    if (m_hasSelection != hasSelection) {
+        m_hasSelection = hasSelection;
+        Q_EMIT selectionChanged();
+    }
     requestFrame(true);
 }
 
@@ -516,25 +585,128 @@ bool viewportRef(::GhosttyTerminal terminal, QPoint cell, GhosttyGridRef* out) {
 
 }  // namespace
 
-bool GhosttyTerminalItem::setSelection(QPoint anchor, QPoint head) {
+// Runs a gesture event and installs the selection it makes. Returns whether it made one.
+bool GhosttyTerminalItem::runGesture(GhosttySelectionGestureEvent event) {
     GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
-    if (!viewportRef(m_terminal, anchor, &selection.start) || !viewportRef(m_terminal, head, &selection.end)) {
-        return false;
-    }
+    if (ghostty_selection_gesture_event(m_gesture, m_terminal, event, &selection) != GHOSTTY_SUCCESS) return false;
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
-    if (!m_hasSelection) {
-        m_hasSelection = true;
-        Q_EMIT selectionChanged();
-    }
-    requestFrame(true);
+    setHasSelection(true);
     return true;
+}
+
+// Gestures work in device pixels, the unit the terminal was sized in.
+void GhosttyTerminalItem::setGestureGeometry(GhosttySelectionGestureEvent event) const {
+    GhosttySelectionGestureGeometry geometry{};
+    geometry.columns = static_cast<uint32_t>(m_columns);
+    geometry.cell_width = static_cast<uint32_t>(std::lround(m_cellWidth * m_dpr));
+    geometry.padding_left = static_cast<uint32_t>(std::lround(m_padding * m_dpr));
+    geometry.screen_height = static_cast<uint32_t>(std::lround(height() * m_dpr));
+    ghostty_selection_gesture_event_set(event, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &geometry);
+}
+
+void GhosttyTerminalItem::setGesturePosition(GhosttySelectionGestureEvent event, QPointF position) const {
+    const GhosttySurfacePosition surface{position.x() * m_dpr, position.y() * m_dpr};
+    ghostty_selection_gesture_event_set(event, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &surface);
+}
+
+void GhosttyTerminalItem::pressSelection(QPointF position) {
+    GhosttyGridRef ref{};
+    if (m_terminal == nullptr || !viewportRef(m_terminal, cellAt(position), &ref)) return;
+    m_selecting = true;
+    m_dragPosition = position;
+    ghostty_selection_gesture_event_set(m_gesturePress, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref);
+    setGesturePosition(m_gesturePress, position);
+    const double distance = m_cellWidth * m_dpr;
+    ghostty_selection_gesture_event_set(m_gesturePress, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE, &distance);
+    // Qt's event times are not to be trusted for this: they are the platform's,
+    // and test events add the double click interval to them.
+    const auto now = static_cast<uint64_t>(m_clock.nsecsElapsed());
+    ghostty_selection_gesture_event_set(m_gesturePress, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS, &now);
+    const uint64_t interval = uint64_t(QGuiApplication::styleHints()->mouseDoubleClickInterval()) * 1000000;
+    ghostty_selection_gesture_event_set(m_gesturePress, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS,
+                                        &interval);
+    // A single click makes no selection; repeats make a word and then a line.
+    if (!runGesture(m_gesturePress)) clearSelection();
+}
+
+void GhosttyTerminalItem::dragSelection(QPointF position) {
+    m_dragPosition = position;
+    // The anchor is gone when a full-screen program took over or the history
+    // dropped it. The drag has nothing left to extend, but the selection stays.
+    GhosttyGridRef anchor = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyGridRef ref{};
+    if (ghostty_selection_gesture_get(m_gesture, m_terminal, GHOSTTY_SELECTION_GESTURE_DATA_ANCHOR, &anchor) !=
+            GHOSTTY_SUCCESS ||
+        !viewportRef(m_terminal, cellAt(position), &ref)) {
+        m_autoscrollTimer.stop();
+        return;
+    }
+    ghostty_selection_gesture_event_set(m_gestureDrag, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &ref);
+    setGesturePosition(m_gestureDrag, position);
+    setGestureGeometry(m_gestureDrag);
+    if (!runGesture(m_gestureDrag)) clearSelection();
+    updateAutoscroll();
+}
+
+void GhosttyTerminalItem::releaseSelection(QPointF position) {
+    m_selecting = false;
+    m_autoscrollTimer.stop();
+    GhosttyGridRef ref{};
+    const bool inside = viewportRef(m_terminal, cellAt(position), &ref);
+    ghostty_selection_gesture_event_set(m_gestureRelease, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF,
+                                        inside ? &ref : nullptr);
+    ghostty_selection_gesture_event(m_gesture, m_terminal, m_gestureRelease, nullptr);
+    if (m_hasSelection && QGuiApplication::clipboard()->supportsSelection())
+        QGuiApplication::clipboard()->setText(selectedText(), QClipboard::Selection);
+}
+
+// One row further while the pointer is held past the edge, with no event to
+// drive it. At the end of the history nothing changes, and nothing repaints.
+void GhosttyTerminalItem::autoscrollSelection() {
+    if (m_terminal == nullptr || !m_selecting) {
+        m_autoscrollTimer.stop();
+        return;
+    }
+    const QPoint cell = cellAt(m_dragPosition);
+    GhosttyPointCoordinate viewport{};
+    viewport.x = static_cast<uint16_t>(cell.x());
+    viewport.y = static_cast<uint32_t>(cell.y());
+    ghostty_selection_gesture_event_set(m_gestureTick, GHOSTTY_SELECTION_GESTURE_EVENT_OPT_VIEWPORT, &viewport);
+    setGesturePosition(m_gestureTick, m_dragPosition);
+    setGestureGeometry(m_gestureTick);
+
+    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+    const GhosttyResult result = ghostty_selection_gesture_event(m_gesture, m_terminal, m_gestureTick, &selection);
+    const qreal before = m_scrollOffset;
+    syncScroll();
+    if (result == GHOSTTY_SUCCESS && m_scrollOffset != before) {
+        ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
+        setHasSelection(true);
+    }
+    updateAutoscroll();
+}
+
+void GhosttyTerminalItem::updateAutoscroll() {
+    GhosttySelectionGestureAutoscroll autoscroll = GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE;
+    ghostty_selection_gesture_get(m_gesture, m_terminal, GHOSTTY_SELECTION_GESTURE_DATA_AUTOSCROLL, &autoscroll);
+    if (autoscroll == GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_NONE) {
+        m_autoscrollTimer.stop();
+    } else if (!m_autoscrollTimer.isActive()) {
+        m_autoscrollTimer.start();
+    }
+}
+
+// The drag ended without its release.
+void GhosttyTerminalItem::cancelSelecting() {
+    m_selecting = false;
+    m_autoscrollTimer.stop();
 }
 
 // --- Keyboard ---------------------------------------------------------------
 
 bool GhosttyTerminalItem::encodeKey(QKeyEvent* event, bool press) {
     if (m_terminal == nullptr) return false;
-    const GhosttyKeyInput key = ghosttyKeyInput(event);
+    const GhosttyKeyInput key = ghosttyKeyInput(event, m_macModifiers);
     if (key.key == GHOSTTY_KEY_UNIDENTIFIED && key.text.isEmpty()) return false;
 
     ghostty_key_encoder_setopt_from_terminal(m_keyEncoder, m_terminal);
@@ -599,6 +771,12 @@ void GhosttyTerminalItem::keyReleaseEvent(QKeyEvent* event) {
 
 void GhosttyTerminalItem::inputMethodEvent(QInputMethodEvent* event) {
     if (!event->commitString().isEmpty()) sendUserInput(event->commitString().toUtf8());
+    if (event->preeditString() != m_preedit) {
+        m_preedit = event->preeditString();
+        // It is drawn at the cursor, so the user has to be able to see the cursor.
+        if (!m_preedit.isEmpty() && !atBottom()) scrollToBottom();
+        requestFrame(true);
+    }
     event->accept();
 }
 
@@ -649,18 +827,21 @@ void GhosttyTerminalItem::focusOutEvent(QFocusEvent* event) {
     }
     m_blinkTimer.stop();
     m_blinkOn = true;
+    // Whatever the input method does with it now is not drawn here.
+    if (!m_preedit.isEmpty()) {
+        m_preedit.clear();
+        requestFrame(true);
+    }
     requestFrame();
 }
 
 // --- Mouse ------------------------------------------------------------------
 
-bool GhosttyTerminalItem::mouseTracking() const {
-    bool tracking = false;
-    if (m_terminal != nullptr) ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking);
-    return tracking;
-}
-
 namespace {
+
+// Shift, Ctrl and Cmd bypass mouse reporting so text can still be selected.
+constexpr Qt::KeyboardModifiers kSelectAnyway = Qt::ShiftModifier | Qt::ControlModifier | Qt::MetaModifier;
+
 
 int ghosttyButton(Qt::MouseButton button) {
     switch (button) {
@@ -695,12 +876,7 @@ bool GhosttyTerminalItem::encodeMouse(int action, int button, Qt::KeyboardModifi
     } else {
         ghostty_mouse_event_set_button(m_mouseEvent, static_cast<GhosttyMouseButton>(button));
     }
-    GhosttyMods mods = 0;
-    if (modifiers & Qt::ShiftModifier) mods |= GHOSTTY_MODS_SHIFT;
-    if (modifiers & Qt::ControlModifier) mods |= GHOSTTY_MODS_CTRL;
-    if (modifiers & Qt::AltModifier) mods |= GHOSTTY_MODS_ALT;
-    if (modifiers & Qt::MetaModifier) mods |= GHOSTTY_MODS_SUPER;
-    ghostty_mouse_event_set_mods(m_mouseEvent, mods);
+    ghostty_mouse_event_set_mods(m_mouseEvent, ghosttyMods(modifiers, m_macModifiers));
     ghostty_mouse_event_set_position(m_mouseEvent, GhosttyMousePosition{float(position.x() * m_dpr),
                                                                          float(position.y() * m_dpr)});
 
@@ -714,8 +890,9 @@ bool GhosttyTerminalItem::encodeMouse(int action, int button, Qt::KeyboardModifi
 
 void GhosttyTerminalItem::mousePressEvent(QMouseEvent* event) {
     forceActiveFocus(Qt::MouseFocusReason);
-    // Shift bypasses mouse reporting so text can still be selected.
-    if (mouseTracking() && !(event->modifiers() & Qt::ShiftModifier)) {
+    if (mouseTracking() && !(event->modifiers() & kSelectAnyway)) {
+        // These clicks are the program's: none of them count towards a repeat.
+        ghostty_selection_gesture_reset(m_gesture, m_terminal);
         m_trackedButtons |= event->button();
         encodeMouse(GHOSTTY_MOUSE_ACTION_PRESS, ghosttyButton(event->button()), event->modifiers(),
                     event->position());
@@ -723,9 +900,7 @@ void GhosttyTerminalItem::mousePressEvent(QMouseEvent* event) {
         return;
     }
     if (event->button() == Qt::LeftButton) {
-        clearSelection();
-        m_selecting = true;
-        m_selectionAnchor = cellAt(event->position());
+        pressSelection(event->position());
     } else if (event->button() == Qt::MiddleButton) {
         paste(QGuiApplication::clipboard()->text(QClipboard::Selection));
     }
@@ -734,12 +909,18 @@ void GhosttyTerminalItem::mousePressEvent(QMouseEvent* event) {
 
 void GhosttyTerminalItem::mouseMoveEvent(QMouseEvent* event) {
     if (m_trackedButtons != Qt::NoButton) {
-        encodeMouse(GHOSTTY_MOUSE_ACTION_MOTION, GHOSTTY_MOUSE_BUTTON_UNKNOWN, event->modifiers(), event->position());
-    } else if (m_selecting) {
-        // Dragging past the top or bottom edge scrolls the history along.
-        if (event->position().y() < m_padding) scrollLines(-1);
-        if (event->position().y() > height() - m_padding) scrollLines(1);
-        setSelection(m_selectionAnchor, cellAt(event->position()));
+        // Button-event tracking (mode 1002) only reports motion with a button down.
+        Qt::MouseButton held = Qt::NoButton;
+        for (const Qt::MouseButton button :
+             {Qt::LeftButton, Qt::MiddleButton, Qt::RightButton, Qt::BackButton, Qt::ForwardButton}) {
+            if (m_trackedButtons & button) {
+                held = button;
+                break;
+            }
+        }
+        encodeMouse(GHOSTTY_MOUSE_ACTION_MOTION, ghosttyButton(held), event->modifiers(), event->position());
+    } else if (m_selecting && m_terminal != nullptr) {
+        dragSelection(event->position());
     }
     event->accept();
 }
@@ -749,32 +930,22 @@ void GhosttyTerminalItem::mouseReleaseEvent(QMouseEvent* event) {
         m_trackedButtons &= ~event->button();
         encodeMouse(GHOSTTY_MOUSE_ACTION_RELEASE, ghosttyButton(event->button()), event->modifiers(),
                     event->position());
-    } else if (m_selecting) {
-        m_selecting = false;
-        if (m_hasSelection && QGuiApplication::clipboard()->supportsSelection())
-            QGuiApplication::clipboard()->setText(selectedText(), QClipboard::Selection);
+    } else if (m_selecting && m_terminal != nullptr) {
+        releaseSelection(event->position());
     }
     event->accept();
 }
 
-void GhosttyTerminalItem::mouseDoubleClickEvent(QMouseEvent* event) {
-    if (event->button() != Qt::LeftButton || (mouseTracking() && !(event->modifiers() & Qt::ShiftModifier))) {
-        mousePressEvent(event);
-        return;
-    }
-    GhosttyTerminalSelectWordOptions options = GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
-    if (!viewportRef(m_terminal, cellAt(event->position()), &options.ref)) return;
-    GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
-    if (ghostty_terminal_select_word(m_terminal, &options, &selection) != GHOSTTY_SUCCESS) return;
-    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_SELECTION, &selection);
-    if (!m_hasSelection) {
-        m_hasSelection = true;
-        Q_EMIT selectionChanged();
-    }
-    if (QGuiApplication::clipboard()->supportsSelection())
-        QGuiApplication::clipboard()->setText(selectedText(), QClipboard::Selection);
-    requestFrame(true);
-    event->accept();
+// Qt sends this on top of the second press, which already counted the repeat
+// and told the program.
+void GhosttyTerminalItem::mouseDoubleClickEvent(QMouseEvent* event) { event->accept(); }
+
+// Something took the mouse: no release is coming.
+void GhosttyTerminalItem::mouseUngrabEvent() {
+    m_trackedButtons = Qt::NoButton;
+    if (!m_selecting) return;
+    cancelSelecting();
+    ghostty_selection_gesture_reset(m_gesture, m_terminal);
 }
 
 void GhosttyTerminalItem::hoverMoveEvent(QHoverEvent* event) {
@@ -798,6 +969,7 @@ void GhosttyTerminalItem::wheelEvent(QWheelEvent* event) {
     event->accept();
     if (steps == 0 || m_terminal == nullptr) return;
 
+    // Only Shift: Ctrl and Cmd with the wheel are still the program's to see.
     if (mouseTracking() && !(event->modifiers() & Qt::ShiftModifier)) {
         // Wheel steps are presses of buttons four (up) and five (down).
         const int button = steps < 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE;
@@ -829,10 +1001,17 @@ void GhosttyTerminalItem::requestFrame(bool full) {
     polish();
 }
 
+// A new blink cycle, if there is one running; updatePolish decides whether there should be.
 void GhosttyTerminalItem::restartBlink() {
     m_blinkOn = true;
-    if (hasActiveFocus()) m_blinkTimer.start();
+    if (m_blinkTimer.isActive()) m_blinkTimer.start();
     requestFrame();
+}
+
+// GNOME with blinking off reports a flash time of 0, which as a timer interval
+// would repaint as fast as it can.
+bool GhosttyTerminalItem::blinkAllowed() const {
+    return m_cursorBlink && QGuiApplication::styleHints()->cursorFlashTime() / 2 > 0;
 }
 
 void GhosttyTerminalItem::updatePolish() {
@@ -859,9 +1038,10 @@ void GhosttyTerminalItem::updatePolish() {
     ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursorInViewport);
     ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_BLINKING, &cursorBlinks);
     if (cursorInViewport) ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cursorY);
-    if (hasActiveFocus() && cursorBlinks != m_blinkTimer.isActive()) {
-        if (cursorBlinks) {
-            m_blinkTimer.start();
+    const bool blinks = cursorBlinks && blinkAllowed();
+    if (hasActiveFocus() && blinks != m_blinkTimer.isActive()) {
+        if (blinks) {
+            m_blinkTimer.start(QGuiApplication::styleHints()->cursorFlashTime() / 2);
         } else {
             m_blinkTimer.stop();
             m_blinkOn = true;
@@ -996,8 +1176,9 @@ void GhosttyTerminalItem::paintRow(QPainter& painter, int y) {
         ghostty_render_state_get(m_renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE, &cursorStyle);
     }
     const bool focused = hasActiveFocus();
+    const bool composing = !m_preedit.isEmpty() && cursorInViewport && cursorY == y;
     const bool drawCursor = cursorVisible && cursorInViewport && cursorY == y && cursorX < m_columns &&
-                            (m_blinkOn || !focused);
+                            (m_blinkOn || !focused) && !composing;
     const QColor cursorColor = colors.cursor_has_value ? toQColor(colors.cursor) : defaultFg;
     if (drawCursor && focused && cursorStyle == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK) {
         Cell& cell = cells[cursorX];
@@ -1097,6 +1278,21 @@ void GhosttyTerminalItem::paintRow(QPainter& painter, int y) {
         } else {
             painter.fillRect(QRectF(cell.left(), cell.bottom() - 2 * stroke, cell.width(), 2 * stroke), cursorColor);
         }
+    }
+
+    // Text being composed sits over the row from the cursor, moved left if it
+    // would run off the end, and underlined until it commits.
+    if (composing) {
+        const int width = qBound(1, int(std::ceil(QFontMetricsF(m_fonts[kRegular]).horizontalAdvance(m_preedit) /
+                                                  m_cellWidth)),
+                                 m_columns);
+        const QRectF band(m_padding + qMin<int>(cursorX, m_columns - width) * m_cellWidth, top, width * m_cellWidth,
+                          m_cellHeight);
+        painter.fillRect(band, defaultBg);
+        painter.setFont(m_fonts[kRegular]);
+        painter.setPen(defaultFg);
+        painter.drawText(QPointF(band.left(), baseline), m_preedit);
+        painter.fillRect(QRectF(band.left(), baseline + line, band.width(), line), defaultFg);
     }
 }
 

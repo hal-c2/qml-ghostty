@@ -108,15 +108,21 @@ GhosttyKey keypadKey(int qtKey) {
 
 }  // namespace
 
-GhosttyKeyInput ghosttyKeyInput(const QKeyEvent* event) {
+uint16_t ghosttyMods(Qt::KeyboardModifiers modifiers, bool macModifiers) {
+    uint16_t mods = 0;
+    if (modifiers & Qt::ShiftModifier) mods |= GHOSTTY_MODS_SHIFT;
+    if (modifiers & Qt::ControlModifier) mods |= macModifiers ? GHOSTTY_MODS_SUPER : GHOSTTY_MODS_CTRL;
+    if (modifiers & Qt::AltModifier) mods |= GHOSTTY_MODS_ALT;
+    if (modifiers & Qt::MetaModifier) mods |= macModifiers ? GHOSTTY_MODS_CTRL : GHOSTTY_MODS_SUPER;
+    return mods;
+}
+
+GhosttyKeyInput ghosttyKeyInput(const QKeyEvent* event, bool macModifiers) {
     GhosttyKeyInput input;
     const int qtKey = event->key();
     const Qt::KeyboardModifiers modifiers = event->modifiers();
 
-    if (modifiers & Qt::ShiftModifier) input.mods |= GHOSTTY_MODS_SHIFT;
-    if (modifiers & Qt::ControlModifier) input.mods |= GHOSTTY_MODS_CTRL;
-    if (modifiers & Qt::AltModifier) input.mods |= GHOSTTY_MODS_ALT;
-    if (modifiers & Qt::MetaModifier) input.mods |= GHOSTTY_MODS_SUPER;
+    input.mods = ghosttyMods(modifiers, macModifiers);
 
     GhosttyKey key = GHOSTTY_KEY_UNIDENTIFIED;
     if (modifiers & Qt::KeypadModifier) key = keypadKey(qtKey);

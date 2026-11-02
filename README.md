@@ -60,6 +60,10 @@ have. The pinned revision is the one hal-c2 vendors in
 | `columns`, `rows`, `cellWidth`, `cellHeight` | Read only. The grid follows the item's size. |
 | `title`, `workingDirectory` | Set by OSC 0/2 and OSC 7. |
 | `hasSelection` | Read only. |
+| `cursorBlink` | Defaults to true. False keeps a blinking cursor steady, for reduced motion. |
+| `macModifiers` | Whether Qt's Control is Cmd and its Meta is Ctrl, as on macOS, so programs get the real keys. Defaults to the platform's. |
+| `mouseTracking` | Read only. Whether the program has asked for the mouse. |
+| `error` | Read only. Why the terminal could not be created; empty when it is healthy. |
 | `scrollTotal`, `scrollOffset`, `atBottom` | Scrollback position in rows, enough to drive a `ScrollBar`. |
 
 | Method | |
@@ -68,7 +72,8 @@ have. The pinned revision is the one hal-c2 vendors in
 | `restore(data)` | Like `write`, but queries in it (DSR, DA) are not answered. Use it to replay retained history. |
 | `reset()` | Blank screen with no history. |
 | `paste(text)` | Bracketed if the program enabled it. Unsafe control bytes are defused. |
-| `copy()`, `selectAll()`, `clearSelection()`, `selectedText()` | Selection and clipboard. |
+| `copy()` | Puts the selection on the clipboard. False with nothing selected, or if the clipboard does not read back the same. |
+| `selectAll()`, `clearSelection()`, `selectedText()` | Selection. |
 | `text()` | Scrollback plus screen as plain text. |
 | `scrollLines(delta)`, `scrollTo(offset)`, `scrollToBottom()` | Viewport scrolling. |
 
@@ -83,8 +88,9 @@ Built-in bindings:
 - Ctrl+Shift+C and Ctrl+Shift+V copy and paste.
 - Shift+Insert pastes.
 - Shift+PgUp and Shift+PgDn scroll.
-- Dragging selects and double-click selects a word. Selections go to the X11/Wayland primary selection, and middle-click pastes it.
-- While the program tracks the mouse, holding Shift bypasses tracking so you can still select.
+- Dragging selects and keeps scrolling while the pointer is held past the top or bottom edge. Double-click selects a word and triple-click a line. Selections go to the X11/Wayland primary selection, and middle-click pastes it.
+- While the program tracks the mouse, holding Shift, Ctrl or Cmd bypasses tracking so you can still select.
+- An input method's composition is drawn at the cursor until it is committed.
 - The wheel scrolls history. In full-screen programs it sends arrow keys instead (alternate scroll mode).
 
 ### Pty
