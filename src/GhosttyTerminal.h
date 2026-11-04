@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QImage>
 #include <QQmlEngine>
@@ -19,6 +20,8 @@ typedef struct GhosttyKeyEncoderImpl* GhosttyKeyEncoder;
 typedef struct GhosttyKeyEventImpl* GhosttyKeyEvent;
 typedef struct GhosttyMouseEncoderImpl* GhosttyMouseEncoder;
 typedef struct GhosttyMouseEventImpl* GhosttyMouseEvent;
+typedef struct GhosttySelectionGestureImpl* GhosttySelectionGesture;
+typedef struct GhosttySelectionGestureEventImpl* GhosttySelectionGestureEvent;
 
 // A terminal surface backed by libghostty-vt. It owns no process: feed it the
 // program's output with write() and send what `input` emits back to the
@@ -48,6 +51,12 @@ class GhosttyTerminalItem : public QQuickItem {
     Q_PROPERTY(qreal padding READ padding WRITE setPadding NOTIFY paddingChanged)
     // Rows of history kept above the screen. Only read before the first write.
     Q_PROPERTY(int scrollbackLimit READ scrollbackLimit WRITE setScrollbackLimit NOTIFY scrollbackLimitChanged)
+    // False keeps the cursor steady even when the program asks it to blink, as
+    // for reduced motion.
+    Q_PROPERTY(bool cursorBlink READ cursorBlink WRITE setCursorBlink NOTIFY cursorBlinkChanged)
+    // Treats Qt's Meta as Ctrl and its Control as Super, which is what they are
+    // on macOS. On by default there, unless the application turned Qt's swap off.
+    Q_PROPERTY(bool macModifiers READ macModifiers WRITE setMacModifiers NOTIFY macModifiersChanged)
 
     Q_PROPERTY(int columns READ columns NOTIFY gridChanged)
     Q_PROPERTY(int rows READ rows NOTIFY gridChanged)
@@ -62,6 +71,11 @@ class GhosttyTerminalItem : public QQuickItem {
     Q_PROPERTY(qreal scrollTotal READ scrollTotal NOTIFY scrollChanged)
     Q_PROPERTY(qreal scrollOffset READ scrollOffset NOTIFY scrollChanged)
     Q_PROPERTY(bool atBottom READ atBottom NOTIFY scrollChanged)
+    // A program has asked for the mouse. Shift, Ctrl and Cmd still select text.
+    Q_PROPERTY(bool mouseTracking READ mouseTracking NOTIFY mouseTrackingChanged)
+    // Why the terminal could not be created; empty when it is healthy. A property
+    // because creation happens before QML can connect to anything.
+    Q_PROPERTY(QString error READ error NOTIFY errorChanged)
 
 public:
     explicit GhosttyTerminalItem(QQuickItem* parent = nullptr);
@@ -83,6 +97,10 @@ public:
     void setPadding(qreal padding);
     int scrollbackLimit() const { return m_scrollbackLimit; }
     void setScrollbackLimit(int rows);
+    bool cursorBlink() const { return m_cursorBlink; }
+    void setCursorBlink(bool blink);
+    bool macModifiers() const { return m_macModifiers; }
+    void setMacModifiers(bool swapped);
 
     int columns() const { return m_columns; }
     int rows() const { return m_rows; }
@@ -94,6 +112,8 @@ public:
     qreal scrollTotal() const { return m_scrollTotal; }
     qreal scrollOffset() const { return m_scrollOffset; }
     bool atBottom() const { return m_scrollOffset + m_rows >= m_scrollTotal; }
+    bool mouseTracking() const { return m_mouseTracking; }
+    QString error() const { return m_error; }
 
     // Program output: a string (encoded as UTF-8) or an ArrayBuffer.
     Q_INVOKABLE void write(const QVariant& data);
@@ -107,7 +127,9 @@ public:
     // Sends text as a paste: bracketed when the program asked for it, with
     // unsafe control bytes defused.
     Q_INVOKABLE void paste(const QString& text);
-    Q_INVOKABLE void copy();
+    // Whether the clipboard took the selection: false with nothing selected, or
+    // when the clipboard does not read back what was put there.
+    Q_INVOKABLE bool copy();
     Q_INVOKABLE void selectAll();
     Q_INVOKABLE void clearSelection();
     Q_INVOKABLE QString selectedText() const;
@@ -128,6 +150,10 @@ signals:
     void workingDirectoryChanged();
     void selectionChanged();
     void scrollChanged();
+    void cursorBlinkChanged();
+    void macModifiersChanged();
+    void mouseTrackingChanged();
+    void errorChanged();
 
     // Bytes for the program: keys, pastes, mouse reports and replies to its
     // queries. UTF-8 except for legacy X10 mouse reports.
@@ -153,6 +179,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void mouseUngrabEvent() override;
     void hoverMoveEvent(QHoverEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
 
@@ -171,12 +198,23 @@ private:
     void syncScroll();
     void requestFrame(bool full = false);
     void restartBlink();
+    bool blinkAllowed() const;
+    void syncMouseTracking();
+    void setError(const QString& error);
+    void setHasSelection(bool hasSelection);
 
     bool encodeKey(QKeyEvent* event, bool press);
-    bool mouseTracking() const;
     bool encodeMouse(int action, int button, Qt::KeyboardModifiers modifiers, QPointF position);
     QPoint cellAt(QPointF position) const;
-    bool setSelection(QPoint anchor, QPoint head);
+    bool runGesture(GhosttySelectionGestureEvent event);
+    void setGestureGeometry(GhosttySelectionGestureEvent event) const;
+    void setGesturePosition(GhosttySelectionGestureEvent event, QPointF position) const;
+    void pressSelection(QPointF position);
+    void dragSelection(QPointF position);
+    void releaseSelection(QPointF position);
+    void autoscrollSelection();
+    void updateAutoscroll();
+    void cancelSelecting();
 
     void paintRow(QPainter& painter, int y);
 
@@ -188,6 +226,11 @@ private:
     GhosttyKeyEvent m_keyEvent = nullptr;
     GhosttyMouseEncoder m_mouseEncoder = nullptr;
     GhosttyMouseEvent m_mouseEvent = nullptr;
+    GhosttySelectionGesture m_gesture = nullptr;
+    GhosttySelectionGestureEvent m_gesturePress = nullptr;
+    GhosttySelectionGestureEvent m_gestureRelease = nullptr;
+    GhosttySelectionGestureEvent m_gestureDrag = nullptr;
+    GhosttySelectionGestureEvent m_gestureTick = nullptr;
 
     QFont m_font;
     std::array<QFont, 4> m_fonts;       // regular, bold, italic, bold italic
@@ -201,6 +244,9 @@ private:
     QByteArray m_defaultPalette;        // Ghostty's own 256 colours
     qreal m_padding = 4;
     int m_scrollbackLimit = 10000;
+    bool m_cursorBlink = true;
+    bool m_macModifiers = false;
+    QString m_error;
 
     int m_columns = 80;
     int m_rows = 24;
@@ -213,6 +259,7 @@ private:
     bool m_hasSelection = false;
     qreal m_scrollTotal = 0;
     qreal m_scrollOffset = 0;
+    bool m_mouseTracking = false;
 
     // Filled by libghostty callbacks while it parses, acted on afterwards.
     QByteArray m_replies;
@@ -228,8 +275,14 @@ private:
     QTimer m_blinkTimer;
     bool m_blinkOn = true;
 
+    // Text the input method is composing, drawn at the cursor until it commits.
+    QString m_preedit;
+
     bool m_selecting = false;
-    QPoint m_selectionAnchor;
+    // Runs only while the pointer is held past the top or bottom edge.
+    QTimer m_autoscrollTimer;
+    QPointF m_dragPosition;
+    QElapsedTimer m_clock;              // times repeat clicks
     Qt::MouseButtons m_trackedButtons;
     qreal m_wheelRemainder = 0;
 };

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <Qt>
 #include <cstdint>
 
 class QKeyEvent;
@@ -16,4 +17,8 @@ struct GhosttyKeyInput {
     QByteArray text;             // UTF-8, never C0 controls or DEL
 };
 
-GhosttyKeyInput ghosttyKeyInput(const QKeyEvent* event);
+// GhosttyMods for Qt's modifiers. Qt on macOS reports the Ctrl key as Meta and
+// Cmd as Control; `macModifiers` says to turn them back.
+uint16_t ghosttyMods(Qt::KeyboardModifiers modifiers, bool macModifiers);
+
+GhosttyKeyInput ghosttyKeyInput(const QKeyEvent* event, bool macModifiers);
